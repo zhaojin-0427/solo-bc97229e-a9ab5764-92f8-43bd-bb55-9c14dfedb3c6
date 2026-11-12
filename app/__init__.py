@@ -3,7 +3,7 @@ import os
 
 from flask import Flask
 
-from . import db, loader, routes
+from . import archive, db, loader, routes
 
 
 def create_app(config=None):
@@ -23,6 +23,12 @@ def create_app(config=None):
 
     os.makedirs(app.config["DATA_DIR"], exist_ok=True)
     db.init_schema(app.config["DATA_DIR"])
+
+    # 进程(重)启动:清理上次归档写盘中断残留的孤儿临时文件
+    # (只删 *.tmp-*;已登记的正式归档文件绝不删除)
+    removed = archive.cleanup_orphan_temp_files(app.config["DATA_DIR"])
+    if removed:
+        app.logger.info("已清理 %d 个归档临时文件残留", removed)
 
     app.register_blueprint(routes.bp)
     app.teardown_appcontext(db.close_db)

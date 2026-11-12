@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>批次归档 · LIMS 检测结果同步平台</title>
+<style>
+  :root { --blue:#1f6feb; --green:#2da44e; --red:#cf222e; --gray:#57606a; --bg:#f6f8fa; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin:0; background:var(--bg); color:#1f2328; }
+  header { background:#0a3069; color:#fff; padding:14px 24px; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { font-size:12px; opacity:.8; margin-top:4px; }
+  header a { color:#9ecbff; text-decoration:none; font-size:13px; }
+  header a:hover { text-decoration:underline; }
+  main { max-width:1180px; margin:0 auto; padding:18px 16px 60px; }
+  section { background:#fff; border:1px solid #d0d7de; border-radius:8px;
+            padding:16px 18px; margin-bottom:16px; }
+  h2 { font-size:15px; margin:0 0 12px; display:flex; align-items:center; gap:8px; }
+  h2 .tag { font-size:11px; font-weight:normal; color:var(--gray); }
+  button { background:var(--blue); color:#fff; border:0; border-radius:6px;
+           padding:6px 14px; font-size:13px; cursor:pointer; }
+  button:hover { filter:brightness(1.1); }
+  button:disabled { background:#94a3b3; cursor:not-allowed; filter:none; }
+  button.ghost { background:#fff; color:var(--blue); border:1px solid var(--blue); }
+  a.dl { display:inline-block; background:var(--green); color:#fff; border-radius:6px;
+         padding:5px 12px; font-size:13px; text-decoration:none; }
+  a.dl:hover { filter:brightness(1.1); }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { border-bottom:1px solid #e5e9ee; padding:6px 8px; text-align:left; }
+  th { background:#f6f8fa; font-weight:600; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; }
+  .pill.done { background:#dafbe1; color:#116329; }
+  .pill.processing { background:#fff8c5; color:#7d4e00; }
+  .pill.failed { background:#ffebe9; color:#82071e; }
+  .pill.archived { background:#ddf4ff; color:#0969da; }
+  .muted { color:var(--gray); font-size:12px; }
+  .reason { color:var(--red); font-size:12px; }
+  code { background:#eff1f3; padding:1px 5px; border-radius:4px; font-size:12px; }
+  #toast { position:fixed; top:14px; right:14px; z-index:9; display:none; max-width:460px;
+           padding:10px 14px; border-radius:8px; color:#fff; font-size:13px;
+           box-shadow:0 4px 14px rgba(0,0,0,.2); white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>批次归档 <a href="/">← 返回上传与取数</a></h1>
+  <div class="sub">已完成增量批次的已确认日志 → gzip NDJSON 归档(按 seq 排序,保留全部字段)·
+    登记与删除在线日志同一事务提交 · 仍需供全量回放的批次拒绝归档</div>
+</header>
+<main>
+  <section>
+    <h2>① 增量批次 <span class="tag">每 2 秒自动刷新;点击“归档”导出并移除在线日志</span></h2>
+    <table id="candidates">
+      <thead><tr><th>批次</th><th>文件</th><th>状态</th><th>在线日志</th><th>seq 范围</th>
+        <th>确认时间</th><th>操作 / 说明</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>② 归档登记 <span class="tag">审计底稿:批次摘要与正式结果保留在库,日志本体在此下载</span></h2>
+    <table id="archives">
+      <thead><tr><th>归档</th><th>批次</th><th>日志条数</th><th>seq 范围</th>
+        <th>大小</th><th>SHA-256</th><th>归档时间</th><th>下载</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>③ 归档语义</h2>
+    <div class="muted" style="line-height:1.9">
+      · 仅 <code>status=done</code> 的增量批次可归档;归档文件为 gzip 压缩的 NDJSON,
+      每行一条日志,含 <code>seq/batch_id/report_no/item/action/result/revision/effect/created_at</code> 全部字段,按 <code>seq</code> 升序。<br>
+      · 若批次的日志仍可能被未完成的全量装载用于切换回放(seq 大于其 start_seq),归档被拒绝并说明原因。<br>
+      · 归档文件完整落盘(临时文件 → fsync → 原子改名)后,登记与删除在线日志在单个事务内提交;
+      写文件期间不持有数据库写事务,增量上传、全量装载与取数不受影响。<br>
+      · 同批重复或并发归档复用同一归档;进程中断后可安全重试,启动时仅清理临时文件残留,
+      已登记归档绝不删除。
+    </div>
+  </section>
+</main>
+<div id="toast"></div>
+<script>
+const $ = s => document.querySelector(s);
+function toast(msg, ok=true){
+  const t = $('#toast'); t.textContent = msg;
+  t.style.background = ok ? '#2da44e' : '#cf222e'; t.style.display='block';
+  clearTimeout(t._h); t._h = setTimeout(()=>t.style.display='none', 5000);
+}
+async function j(url, opts){
+  const r = await fetch(url, opts);
+  const data = await r.json().catch(()=>({ok:false,error:'响应解析失败'}));
+  if(!r.ok) throw new Error(data.error || ('HTTP '+r.status));
+  return data;
+}
+const STATUS = {done:'已完成', processing:'确认中', failed:'失败'};
+const esc = s => String(s??'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmtSize = n => n<1024 ? n+' B' : n<1048576 ? (n/1024).toFixed(1)+' KB' : (n/1048576).toFixed(2)+' MB';
+const seqRange = (a,b) => (a==null) ? '—' : (a===b ? '#'+a : '#'+a+' ~ #'+b);
+
+async function refreshCandidates(){
+  try{
+    const d = await j('/api/archive/candidates');
+    const tb = $('#candidates tbody'); tb.innerHTML='';
+    if(!d.candidates.length){
+      tb.innerHTML = '<tr><td colspan="7" class="muted">暂无增量批次,请先在首页上传增量 CSV。</td></tr>';
+      return;
+    }
+    for(const c of d.candidates){
+      const tr = document.createElement('tr');
+      let op;
+      if(c.archive){
+        op = `<span class="pill archived">已归档 #${c.archive.id}</span> ` +
+             `<a class="dl" href="${c.archive.download_url}">下载</a>`;
+      }else if(c.archivable){
+        op = `<button data-b="${c.id}">归档</button>`;
+      }else{
+        op = `<span class="reason">${esc(c.reason)}</span>`;
+      }
+      tr.innerHTML =
+        `<td>#${c.id}</td><td>${esc(c.orig_name)||''}</td>` +
+        `<td><span class="pill ${c.status}">${STATUS[c.status]||c.status}</span></td>` +
+        `<td>${c.archive ? 0 : c.log_rows}</td>` +
+        `<td>${c.archive ? seqRange(c.archive.first_seq, c.archive.last_seq)
+                          : seqRange(c.first_seq, c.last_seq)}</td>` +
+        `<td class="muted">${c.created_at||''}</td><td>${op}</td>`;
+      tb.appendChild(tr);
+    }
+    tb.querySelectorAll('button[data-b]').forEach(btn=>btn.addEventListener('click', async ()=>{
+      btn.disabled = true; btn.textContent = '归档中…';
+      try{
+        const d = await j('/api/archive/'+btn.dataset.b, {method:'POST'});
+        toast(d.message, true);
+      }catch(e){ toast(e.message, false); }
+      refreshAll();
+    }));
+  }catch(e){}
+}
+
+async function refreshArchives(){
+  try{
+    const d = await j('/api/archives');
+    const tb = $('#archives tbody'); tb.innerHTML='';
+    if(!d.archives.length){
+      tb.innerHTML = '<tr><td colspan="8" class="muted">暂无归档。</td></tr>';
+      return;
+    }
+    for(const a of d.archives){
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        `<td>#${a.id}</td><td>#${a.batch_id}</td><td>${a.row_count}</td>` +
+        `<td>${seqRange(a.first_seq, a.last_seq)}</td><td>${fmtSize(a.file_bytes)}</td>` +
+        `<td class="muted" title="${a.sha256}">${a.sha256.slice(0,12)}…</td>` +
+        `<td class="muted">${a.created_at}</td>` +
+        `<td><a class="dl" href="${a.download_url}">下载 .ndjson.gz</a></td>`;
+      tb.appendChild(tr);
+    }
+  }catch(e){}
+}
+
+function refreshAll(){ refreshCandidates(); refreshArchives(); }
+refreshAll();
+setInterval(refreshAll, 2000);
+</script>
+</body>
+</html>

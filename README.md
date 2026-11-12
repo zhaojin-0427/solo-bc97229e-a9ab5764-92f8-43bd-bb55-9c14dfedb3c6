@@ -52,6 +52,10 @@ python -m pytest tests/ -q
 
 可随时点击 **读取当前有效结果** 演示报告系统取数;**含撤回墓碑** 可查看撤回水位。
 
+7. **批次归档**(顶部导航「批次归档 →」或访问 `/archive`):已完成的增量批次可一键归档
+   —— 该批全部已确认日志按 `seq` 写成 gzip NDJSON 文件供下载,登记后在线日志移出在线表,
+   批次摘要与正式结果保留。若日志仍需供未完成的全量装载回放,归档被拒绝并说明原因。
+
 ## CSV 格式
 
 表头支持英文或中文(可混用),UTF-8(兼容 BOM):
@@ -86,13 +90,18 @@ python -m pytest tests/ -q
 | 方法/路径 | 说明 |
 |---|---|
 | `GET /` | 演示页面(上传、进度、取数) |
+| `GET /archive` | 批次归档页(发起归档、查看状态、下载归档文件) |
 | `POST /upload/full` | 上传全量 CSV(multipart `file`),后台装载;已有装载进行中返回 `409` |
 | `POST /upload/inc` | 上传增量 CSV,请求内同步确认,响应返回时已更新正式表 |
 | `POST /load_sample/<name>` | 载入随附示例(`full_baseline`、`inc_corrections`、`inc_withdrawals`、`inc_after_withdraw`、`full_large`、`inc_during_load`、`full_baseline_v2`) |
 | `GET /api/results` | **报告系统取数接口**:当前完整有效结果;参数 `report_no` 过滤、`all=1` 含墓碑 |
 | `GET /api/batches` | 导入批次与进度(全量/增量、状态、行数、百分比) |
-| `GET /api/increments` | 已确认增量日志(全局序号、动作、效果) |
+| `GET /api/increments` | 已确认增量日志(全局序号、动作、效果);已归档批次的日志不在其中 |
 | `GET /api/status` | 汇总:有效结果数、墓碑数、增量数、是否有装载进行中 |
+| `GET /api/archive/candidates` | 增量批次清单:在线日志数、seq 范围、归档状态;不可归档时给出原因 |
+| `POST /api/archive/<batch_id>` | 归档一个已完成增量批次(幂等:已归档返回既有登记;需回放返回 `409`) |
+| `GET /api/archives` | 归档登记列表(条数、seq 范围、大小、SHA-256、时间) |
+| `GET /api/archives/<id>/download` | 下载归档文件(gzip NDJSON) |
 | `GET /api/health` | 健康检查 |
 
 取数接口为单条 `SELECT`(WAL 快照读),每次读取均为**切换前或切换后的完整有效结果**,
@@ -111,18 +120,40 @@ python -m pytest tests/ -q
 - **即时生效**:增量在上传请求内同步确认,立即更新现有正式表,与后台装载并行不悖
   (SQLite 写事务串行化 + busy_timeout,WAL 下读不阻塞)。
 
+## 增量批次归档
+
+已完成(`done`)的增量批次可从在线表移出,转为可下载的审计归档:
+
+- **归档文件**:该批全部已确认日志按 `seq` 升序写成 gzip NDJSON,每行一条日志,
+  保留 `seq/batch_id/report_no/item/action/result/revision/effect/created_at` 全部字段;
+  登记记录含文件字节数与 SHA-256 供完整性校验。
+- **先落盘后登记**:日志读出后在**不持有数据库写事务**的情况下写临时文件 →
+  fsync → 原子改名 → 目录 fsync;文件完整持久化后,`archives` 登记与
+  `DELETE increments` 在**单个事务**内提交。写文件期间增量上传、全量装载与
+  取数接口完全可用。
+- **回放保护**:若批次日志的最大 `seq` 大于某未完成全量装载(loading/staging_ready)
+  的 `start_seq`,说明切换回放仍需要这些日志,归档被拒绝并说明原因;该检查在
+  提交事务内复查,与全量批次创建串行化,无竞态。
+- **幂等**:`archives.batch_id` 唯一约束 + 进程内每批互斥锁,同批重复或并发归档
+  复用同一登记与文件(文件名按批次确定,gzip 头 `mtime=0`,重写内容一致)。
+- **崩溃安全**:登记提交前崩溃 → 在线日志完整保留,重试即可;登记提交后崩溃 →
+  归档已可下载。进程启动时仅清理 `*.tmp-*` 孤儿临时文件,已登记的归档文件
+  绝不删除;归档文件持久化在数据卷 `archives/` 子目录。
+
 ## 目录结构
 
 ```
 app/
-  __init__.py   应用工厂(启动时触发恢复)
-  db.py         SQLite 连接与表结构(batches/results/results_staging/increments)
+  __init__.py   应用工厂(启动时触发恢复 + 清理归档临时文件残留)
+  db.py         SQLite 连接与表结构(batches/results/results_staging/increments/archives)
   logic.py      修订裁决、撤回墓碑、合并切换、CSV 解析
   loader.py     后台装载、断点续传、崩溃恢复、单装载调度
-  routes.py     上传/进度/取数接口与页面
-  templates/index.html
+  archive.py    增量批次归档:gzip NDJSON 导出、登记+删除同事务、回放保护、孤儿清理
+  routes.py     上传/进度/取数/归档接口与页面
+  templates/index.html     上传、进度与取数演示页
+  templates/archive.html   批次归档页(发起、状态、下载)
 samples/        全量与装载中更正/撤回示例文件
-tests/          21 个用例:语义、切换、恢复、单装载、接口
+tests/          34 个用例:语义、切换、恢复、单装载、接口、归档
 wsgi.py         gunicorn wsgi:app
 Dockerfile / docker-compose.yml
 ```

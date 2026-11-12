@@ -70,6 +70,20 @@ CREATE TABLE IF NOT EXISTS increments (
     effect      TEXT,                           -- applied|stale|withdrawn|recorded
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- 增量批次归档登记:登记与删除在线日志在同一事务提交。
+-- 登记存在 <=> 归档文件已完整落盘且该批在线日志已删除。
+CREATE TABLE IF NOT EXISTS archives (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id    INTEGER NOT NULL UNIQUE REFERENCES batches(id), -- 每批至多归档一次(幂等)
+    filename    TEXT NOT NULL,              -- 归档文件绝对路径(gzip NDJSON)
+    file_bytes  INTEGER NOT NULL,
+    sha256      TEXT NOT NULL,              -- 归档文件内容的 SHA-256
+    row_count   INTEGER NOT NULL,           -- 归档的日志条数
+    first_seq   INTEGER,                    -- 归档日志的最小 seq
+    last_seq    INTEGER,                    -- 归档日志的最大 seq
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 

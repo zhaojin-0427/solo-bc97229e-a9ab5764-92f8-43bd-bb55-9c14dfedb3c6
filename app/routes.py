@@ -1,11 +1,12 @@
-"""HTTP 接口:上传、进度、取数、页面。"""
+"""HTTP 接口:上传、进度、取数、归档、页面。"""
 import os
 import sqlite3
 import uuid
 
-from flask import (Blueprint, current_app, jsonify, render_template, request)
+from flask import (Blueprint, current_app, jsonify, render_template, request,
+                   send_file)
 
-from . import db, loader, logic
+from . import archive, db, loader, logic
 
 bp = Blueprint("main", __name__)
 
@@ -93,6 +94,12 @@ def _poke(app):
 @bp.get("/")
 def index():
     return render_template("index.html", samples=sorted(SAMPLE_FILES.keys()))
+
+
+@bp.get("/archive")
+def archive_page():
+    """批次归档页:发起归档、查看状态、下载归档文件。"""
+    return render_template("archive.html")
 
 
 # ------------------------------------------------------------------ 上传
@@ -214,3 +221,92 @@ def api_status():
 @bp.get("/api/health")
 def api_health():
     return jsonify({"ok": True})
+
+
+# ------------------------------------------------------------------ 批次归档
+
+def _archive_json(row):
+    return {
+        "id": row["id"], "batch_id": row["batch_id"],
+        "file_bytes": row["file_bytes"], "sha256": row["sha256"],
+        "row_count": row["row_count"],
+        "first_seq": row["first_seq"], "last_seq": row["last_seq"],
+        "created_at": row["created_at"],
+        "download_url": f"/api/archives/{row['id']}/download",
+    }
+
+
+@bp.get("/api/archive/candidates")
+def api_archive_candidates():
+    """增量批次清单:归档状态、日志条数、seq 范围;不可归档时给出原因。"""
+    conn = db.get_db()
+    rows = conn.execute(
+        """
+        SELECT b.id, b.status, b.orig_name, b.total_rows, b.applied_rows,
+               b.error_rows, b.created_at,
+               (SELECT COUNT(*) FROM increments i WHERE i.batch_id = b.id) AS log_rows,
+               (SELECT MIN(seq) FROM increments i WHERE i.batch_id = b.id) AS first_seq,
+               (SELECT MAX(seq) FROM increments i WHERE i.batch_id = b.id) AS last_seq
+          FROM batches b WHERE b.kind = 'inc' ORDER BY b.id DESC LIMIT 50
+        """).fetchall()
+    candidates = []
+    for b in rows:
+        item = {
+            "id": b["id"], "status": b["status"], "orig_name": b["orig_name"],
+            "total_rows": b["total_rows"], "applied_rows": b["applied_rows"],
+            "error_rows": b["error_rows"], "created_at": b["created_at"],
+            "log_rows": b["log_rows"],
+            "first_seq": b["first_seq"], "last_seq": b["last_seq"],
+            "archive": None, "archivable": False, "reason": None,
+        }
+        arch = archive.get_archive(conn, b["id"])
+        if arch is not None:
+            item["archive"] = _archive_json(arch)
+        elif b["status"] != "done":
+            item["reason"] = f"批次状态为 {b['status']},仅已完成的增量批次可归档"
+        else:
+            blockers = archive.replay_blockers(conn, b["id"])
+            if blockers:
+                item["reason"] = archive._blocker_message(b["id"], blockers)
+            else:
+                item["archivable"] = True
+        candidates.append(item)
+    return jsonify({"candidates": candidates})
+
+
+@bp.post("/api/archive/<int:batch_id>")
+def api_archive_batch(batch_id):
+    """归档一个已完成增量批次。幂等:已归档则返回既有登记(200)。"""
+    try:
+        rec, created = archive.archive_batch(
+            current_app.config["DATA_DIR"], batch_id)
+    except archive.ArchiveRefused as exc:
+        return _err(str(exc), 409)
+    payload = _archive_json(rec)
+    payload["created"] = created
+    msg = (f"批次 #{batch_id} 已归档: {rec['row_count']} 条日志写入 "
+           f"{os.path.basename(rec['filename'])},在线日志已移除"
+           if created else
+           f"批次 #{batch_id} 此前已归档,复用同一归档文件与登记")
+    return jsonify({"ok": True, "archive": payload, "message": msg})
+
+
+@bp.get("/api/archives")
+def api_archives():
+    rows = archive.list_archives(db.get_db())
+    return jsonify({"archives": [_archive_json(r) for r in rows]})
+
+
+@bp.get("/api/archives/<int:archive_id>/download")
+def api_archive_download(archive_id):
+    row = db.get_db().execute(
+        "SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
+    if row is None:
+        return _err(f"归档 #{archive_id} 不存在", 404)
+    if not os.path.exists(row["filename"]):
+        current_app.logger.error("归档 #%s 已登记但文件缺失: %s",
+                                 archive_id, row["filename"])
+        return _err("归档文件缺失(登记存在但文件不在磁盘上),请联系管理员", 500)
+    return send_file(row["filename"], mimetype="application/gzip",
+                     as_attachment=True,
+                     download_name=os.path.basename(row["filename"]))
